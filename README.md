@@ -79,6 +79,8 @@ python -m playwright install chromium
   可选，自定义 `biliup` 可执行文件路径或命令名，默认 `biliup`。
 - `BILIUP_COOKIE`
   可选，手动指定 `biliup` cookie 文件路径。优先级低于 `--bili-cookie`，高于默认 `.auth/bilibili.cookies.json`。
+- `BILIBILI_DEFAULT_TID`
+  可选，只有当显式 `--tid` 未提供且规则分区没有命中时，才作为投稿分区兜底值。
 
 安全提醒：
 
@@ -114,8 +116,58 @@ scripts/run_biliup_login_helper.sh --browser chrome
 
 1. 先配置 Volcengine 环境变量。
 2. 跑一次 Bilibili 登录助手。
-3. 用 `--dry-run` 生成字幕、视频和投稿元数据。
-4. 确认标题、字幕和元数据没问题后再正式上传。
+3. 在 Codex 会话里先生成中文标题、投稿简介和投稿分区。
+4. 用 `--dry-run` 生成字幕、视频和投稿元数据。
+5. 确认标题、字幕和元数据没问题后再正式上传。
+
+## 投稿分区
+
+默认优先级：
+
+1. 显式传入 `--tid`
+2. 根据标题、标签、简介和前 20 段字幕做规则分区
+3. `BILIBILI_DEFAULT_TID`
+4. `36`（知识区）
+
+当前脚本内置规则只覆盖少量高频分类：
+
+- `188` 科技
+- `36` 知识
+- `160` 生活
+- `171` 电子竞技
+
+说明：
+
+- 上面这 4 个值表示“用户意图分区”
+- 实际投稿时，脚本会自动映射到可投稿的叶子分区
+- 例如 `188` 会映射到科技区子分区 `231`（计算机技术）
+
+如果你是在 Codex 中使用这个 skill，推荐由助手先决定 `--tid`，脚本只负责执行。
+
+## 投稿简介
+
+默认优先级：
+
+1. 显式传入 `--desc`
+2. 回退到默认简介
+
+如果你是在 Codex 中使用这个 skill，推荐由助手先生成投稿简介，再通过 `--desc` 传给脚本。
+
+## 投稿版权
+
+默认投稿类型现在是 `自制`：
+
+- 默认 `--copyright 1`
+- 只有显式传 `--copyright 2` 时，才按转载处理
+- 只有转载时才会附 `--source`
+
+默认可见性：
+
+- 默认 `--is-only-self 0`
+- 也就是直接正常投稿
+- 如果你想先存为草稿再手动检查，可以显式传 `--is-only-self 1`
+
+这套默认值适合你当前“已获得原作者授权”的使用场景。
 
 ## 字幕模式
 
@@ -192,8 +244,45 @@ scripts/run_publish_localized_video.sh \
   --workdir ".\runs\demo" `
   --mode dub `
   --translation-mode auto `
+  --translation-quality high
+```
+
+### Codex 模式：由助手传入简介和分区
+
+```powershell
+.\scripts\run_publish_localized_video.ps1 `
+  --input "https://www.youtube.com/watch?v=VIDEO_ID" `
+  --workdir ".\runs\demo" `
+  --mode subtitles `
+  --translation-mode api `
   --translation-quality high `
-  --tid 171
+  --translated-title "这里填助手生成的中文标题" `
+  --desc "这里填助手生成的投稿简介" `
+  --tid 188
+```
+
+### CLI 模式：手动覆盖投稿分区
+
+```powershell
+.\scripts\run_publish_localized_video.ps1 `
+  --input "https://www.youtube.com/watch?v=VIDEO_ID" `
+  --workdir ".\runs\demo" `
+  --mode subtitles `
+  --translation-mode api `
+  --translation-quality high `
+  --tid 188
+```
+
+### 显式按转载投稿
+
+```powershell
+.\scripts\run_publish_localized_video.ps1 `
+  --input "https://www.youtube.com/watch?v=VIDEO_ID" `
+  --workdir ".\runs\demo" `
+  --mode subtitles `
+  --translation-mode api `
+  --translation-quality high `
+  --copyright 2
 ```
 
 ### 复用已有 transcript，避免重复 ASR
@@ -227,6 +316,12 @@ scripts/run_publish_localized_video.sh \
 - `glossary_file_used`
 - `segment_refinement_used`
 - `bili_cookie_path_used`
+- `tid_used`
+- `tid_source`
+- `tid_reason`
+- `description_used`
+- `description_source`
+- `description_reason`
 
 ## 常见问题
 

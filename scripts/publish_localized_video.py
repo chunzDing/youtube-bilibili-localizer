@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from bilibili_auth import resolve_bili_cookie_path, resolve_skill_root
+from bilibili_auth import ensure_biliup_cookie_path, resolve_skill_root
 from translation_utils import (
     LoadedGlossary,
     clean_title_text,
@@ -22,6 +22,117 @@ from translation_utils import (
 
 TITLE_PREFIX = "【中文字幕】"
 DEFAULT_TAGS = "中文字幕,翻译,搬运"
+DEFAULT_TID_FALLBACK = 36
+TID_ENV_VAR = "BILIBILI_DEFAULT_TID"
+SUBTITLE_SAMPLE_LIMIT = 20
+CATEGORY_PRIORITY = [171, 188, 160, 36]
+CATEGORY_UPLOAD_TID_MAP = {
+    188: 231,
+    36: 122,
+    160: 21,
+    171: 171,
+}
+CATEGORY_UPLOAD_INFO = {
+    231: {"name": "计算机技术", "parent_tid": 188, "parent_name": "科技"},
+    122: {"name": "野生技能协会", "parent_tid": 36, "parent_name": "知识"},
+    21: {"name": "日常", "parent_tid": 160, "parent_name": "生活"},
+    171: {"name": "电子竞技", "parent_tid": 171, "parent_name": "电子竞技"},
+}
+CATEGORY_RULES = {
+    188: {
+        "name": "科技",
+        "keywords": [
+            "ai",
+            "artificial intelligence",
+            "人工智能",
+            "llm",
+            "gpt",
+            "claude",
+            "agent",
+            "ai agent",
+            "vibe coding",
+            "coding",
+            "code",
+            "programming",
+            "编程",
+            "开发",
+            "software",
+            "app",
+            "website",
+            "saas",
+            "tool",
+            "workflow",
+            "automation",
+            "prompt",
+            "cursor",
+            "base44",
+        ],
+    },
+    36: {
+        "name": "知识",
+        "keywords": [
+            "tutorial",
+            "guide",
+            "course",
+            "lesson",
+            "explained",
+            "how to",
+            "tips",
+            "beginner",
+            "入门",
+            "教程",
+            "教学",
+            "讲解",
+            "科普",
+            "总结",
+            "复盘",
+            "清单",
+        ],
+    },
+    160: {
+        "name": "生活",
+        "keywords": [
+            "vlog",
+            "daily",
+            "routine",
+            "desk setup",
+            "study with me",
+            "room tour",
+            "开箱",
+            "日常",
+            "生活",
+            "通勤",
+            "居家",
+            "学习记录",
+            "桌搭",
+        ],
+    },
+    171: {
+        "name": "电子竞技",
+        "keywords": [
+            "esports",
+            "电竞",
+            "league of legends",
+            "lol",
+            "valorant",
+            "dota",
+            "cs2",
+            "counter-strike",
+            "apex",
+            "overwatch",
+            "英雄联盟",
+            "无畏契约",
+            "刀塔",
+            "反恐精英",
+            "赛事",
+            "战队",
+            "比赛",
+            "ranked",
+            "scrim",
+            "patch",
+        ],
+    },
+}
 
 
 class TranslationFailure(RuntimeError):
@@ -376,12 +487,259 @@ def selected_video_path(workdir: Path, mode: str) -> Path:
     raise SystemExit(f"could not find a video to upload in {workdir}")
 
 
+def normalize_category_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().lower())
+
+
+def keyword_in_text(text: str, keyword: str) -> bool:
+    normalized_text = normalize_category_text(text)
+    normalized_keyword = normalize_category_text(keyword)
+    if not normalized_text or not normalized_keyword:
+        return False
+    if re.fullmatch(r"[a-z0-9][a-z0-9\s\-\+]*", normalized_keyword):
+        pattern = r"(?<![a-z0-9])" + re.escape(normalized_keyword).replace(r"\ ", r"\s+") + r"(?![a-z0-9])"
+        return bool(re.search(pattern, normalized_text))
+    return normalized_keyword in normalized_text
+
+
+def collect_category_matches(text: str, keywords: list[str]) -> list[str]:
+    matches: list[str] = []
+    for keyword in keywords:
+        if keyword_in_text(text, keyword):
+            matches.append(keyword)
+    return matches
+
+
+def load_subtitle_sample_text(workdir: Path, limit: int = SUBTITLE_SAMPLE_LIMIT) -> str:
+    translated_segments_path = workdir / "translated_segments.json"
+    if not translated_segments_path.exists():
+        return ""
+
+    payload = json.loads(translated_segments_path.read_text(encoding="utf-8"))
+    segments = payload.get("segments") or []
+    parts: list[str] = []
+    for item in segments[:limit]:
+        if not isinstance(item, dict):
+            continue
+        for field_name in ("text", "translated_text"):
+            value = str(item.get(field_name) or "").strip()
+            if value:
+                parts.append(value)
+    return "\n".join(parts)
+
+
+def score_category_candidates(
+    title: str,
+    tags: str,
+    desc: str,
+    subtitle_sample: str,
+) -> dict[int, dict[str, Any]]:
+    source_text = {
+        "title": title,
+        "tags": tags,
+        "desc": desc,
+        "subtitles": subtitle_sample,
+    }
+    source_weights = {
+        "title": 3,
+        "tags": 2,
+        "desc": 1,
+        "subtitles": 1,
+    }
+    results: dict[int, dict[str, Any]] = {}
+    for tid, config in CATEGORY_RULES.items():
+        score = 0
+        matches_by_source: dict[str, list[str]] = {}
+        for source_name, text in source_text.items():
+            matches = sorted(dict.fromkeys(collect_category_matches(text, config["keywords"])))
+            if matches:
+                matches_by_source[source_name] = matches
+                score += len(matches) * source_weights[source_name]
+        results[tid] = {
+            "tid": tid,
+            "name": config["name"],
+            "score": score,
+            "matches": matches_by_source,
+        }
+    return results
+
+
+def format_tid_reason(score_entry: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for source_name in ("title", "tags", "desc", "subtitles"):
+        matches = score_entry["matches"].get(source_name) or []
+        if matches:
+            parts.append(f"{source_name}: {', '.join(matches)}")
+    if not parts:
+        return "No category keywords matched"
+    return f"Matched {score_entry['name']} keywords; " + "; ".join(parts)
+
+
+def parse_default_tid_env(raw_value: str | None) -> int | None:
+    if raw_value is None:
+        return None
+    normalized = raw_value.strip()
+    if not normalized:
+        return None
+    if not normalized.isdigit() or int(normalized) <= 0:
+        raise SystemExit(f"{TID_ENV_VAR} must be a positive integer, got: {raw_value}")
+    return int(normalized)
+
+
+def normalize_upload_tid(tid: int) -> dict[str, Any]:
+    upload_tid = CATEGORY_UPLOAD_TID_MAP.get(tid, tid)
+    upload_info = CATEGORY_UPLOAD_INFO.get(upload_tid, {})
+    parent_tid = upload_info.get("parent_tid", upload_tid)
+    parent_name = upload_info.get("parent_name") or CATEGORY_RULES.get(parent_tid, {}).get("name", "")
+    leaf_name = upload_info.get("name") or CATEGORY_RULES.get(upload_tid, {}).get("name", "")
+    return {
+        "requested_tid": tid,
+        "tid": upload_tid,
+        "name": leaf_name,
+        "parent_tid": parent_tid,
+        "parent_name": parent_name,
+    }
+
+
+def resolve_rule_tid(
+    workdir: Path,
+    title: str,
+    tags: str,
+    desc: str,
+) -> dict[str, Any]:
+    subtitle_sample = load_subtitle_sample_text(workdir)
+    scores = score_category_candidates(title, tags, desc, subtitle_sample)
+    priority_rank = {tid: index for index, tid in enumerate(CATEGORY_PRIORITY)}
+    best = sorted(
+        scores.values(),
+        key=lambda item: (-item["score"], priority_rank.get(item["tid"], len(CATEGORY_PRIORITY))),
+    )[0]
+    if best["score"] > 0:
+        normalized = normalize_upload_tid(best["tid"])
+        return {
+            "tid": normalized["tid"],
+            "name": normalized["name"],
+            "parent_tid": normalized["parent_tid"],
+            "parent_name": normalized["parent_name"],
+            "source": "rule",
+            "reason": (
+                f"{format_tid_reason(best)}; upload tid {normalized['tid']} "
+                f"({normalized['parent_name']}/{normalized['name']})"
+            ),
+            "matched_keywords": best["matches"],
+        }
+
+    return {}
+
+
+def resolve_upload_tid(
+    args: argparse.Namespace,
+    workdir: Path,
+    title: str,
+    tags: str,
+    desc: str,
+) -> dict[str, Any]:
+    if args.tid:
+        normalized = normalize_upload_tid(int(args.tid))
+        if normalized["requested_tid"] != normalized["tid"]:
+            reason = (
+                f"Using explicit --tid {normalized['requested_tid']}; mapped to upload tid "
+                f"{normalized['tid']} ({normalized['parent_name']}/{normalized['name']})"
+            )
+        else:
+            reason = f"Using explicit --tid {normalized['tid']}"
+        return {
+            "tid": normalized["tid"],
+            "name": normalized["name"],
+            "parent_tid": normalized["parent_tid"],
+            "parent_name": normalized["parent_name"],
+            "source": "argument",
+            "reason": reason,
+            "matched_keywords": {},
+        }
+
+    rule_resolution = resolve_rule_tid(workdir, title, tags, desc)
+    if rule_resolution:
+        return rule_resolution
+
+    env_tid = parse_default_tid_env(os.environ.get(TID_ENV_VAR))
+    if env_tid is not None:
+        normalized = normalize_upload_tid(env_tid)
+        return {
+            "tid": normalized["tid"],
+            "name": normalized["name"],
+            "parent_tid": normalized["parent_tid"],
+            "parent_name": normalized["parent_name"],
+            "source": "environment",
+            "reason": (
+                f"No category keywords matched; using {TID_ENV_VAR}={env_tid} "
+                f"-> upload tid {normalized['tid']} ({normalized['parent_name']}/{normalized['name']})"
+            ),
+            "matched_keywords": {},
+        }
+
+    normalized = normalize_upload_tid(DEFAULT_TID_FALLBACK)
+    return {
+        "tid": normalized["tid"],
+        "name": normalized["name"],
+        "parent_tid": normalized["parent_tid"],
+        "parent_name": normalized["parent_name"],
+        "source": "fallback",
+        "reason": (
+            f"No category keywords matched; falling back to {DEFAULT_TID_FALLBACK} "
+            f"({CATEGORY_RULES[DEFAULT_TID_FALLBACK]['name']}) -> upload tid "
+            f"{normalized['tid']} ({normalized['parent_name']}/{normalized['name']})"
+        ),
+        "matched_keywords": {},
+    }
+
+
+def print_tid_resolution(resolution: dict[str, Any]) -> None:
+    category_name = resolution.get("name") or "unknown"
+    parent_name = resolution.get("parent_name") or category_name
+    print(
+        f"Bilibili category resolved: {parent_name}/{category_name} ({resolution['tid']}) "
+        f"[source={resolution['source']}]",
+        flush=True,
+    )
+    print(f"TID reason: {resolution['reason']}", flush=True)
+
+
+def fallback_description(source_url: str | None) -> str:
+    if source_url:
+        return f"原视频链接: {source_url}"
+    return "本视频已完成中文字幕本地化，欢迎观看。"
+
+
+def resolve_upload_description(
+    args: argparse.Namespace,
+    *,
+    title: str,
+    tags: str,
+    source_url: str | None,
+    workdir: Path,
+) -> dict[str, str]:
+    if args.desc:
+        return {
+            "desc": args.desc,
+            "source": "argument",
+            "reason": "Using explicit --desc",
+        }
+    return {
+        "desc": fallback_description(source_url),
+        "source": "fallback",
+        "reason": "No explicit --desc provided; using default description fallback",
+    }
+
+
 def build_biliup_command(
     args: argparse.Namespace,
     video_path: Path,
     title: str,
+    desc: str,
     source_url: str | None,
     cookie_path: Path | None,
+    resolved_tid: int,
 ) -> list[str]:
     biliup_bin = args.biliup_bin or os.environ.get("BILIUP_BIN") or "biliup"
     cmd = [biliup_bin]
@@ -389,18 +747,16 @@ def build_biliup_command(
         cmd.extend(["--user-cookie", str(cookie_path)])
     cmd.extend(["upload", str(video_path), "--title", title])
 
-    if args.desc:
-        cmd.extend(["--desc", args.desc])
-    elif source_url:
-        cmd.extend(["--desc", f"原视频链接: {source_url}"])
+    if desc:
+        cmd.extend(["--desc", desc])
 
     tags = args.tags or DEFAULT_TAGS
     if tags:
         cmd.extend(["--tag", tags])
-    if args.tid:
-        cmd.extend(["--tid", str(args.tid)])
+    cmd.extend(["--tid", str(resolved_tid)])
     if args.copyright:
         cmd.extend(["--copyright", str(args.copyright)])
+    cmd.extend(["--is-only-self", str(args.is_only_self)])
     if args.copyright == 2 and source_url:
         cmd.extend(["--source", source_url])
     if args.cover:
@@ -432,7 +788,7 @@ def load_subtitle_translation_info(workdir: Path, subtitle_layout: str) -> dict[
 def classify_upload_failure(result: subprocess.CompletedProcess[str]) -> str:
     combined = f"{result.stdout}\n{result.stderr}".lower()
     if "账号未登录" in combined or "not login" in combined or "code: -101" in combined:
-        return "Bilibili account is not logged in. Re-run the login helper and try again."
+        return "Bilibili account is not logged in. Complete biliup login and try again."
     if "no such file" in combined or "cannot find the file" in combined:
         return "The configured biliup cookie path does not exist."
     if "copyright" in combined or "tid" in combined or "参数" in combined:
@@ -470,6 +826,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-url", help="Optional source URL or reference text kept in metadata and used for repost submissions")
     parser.add_argument("--tid", type=int, help="Bilibili category id")
     parser.add_argument("--copyright", type=int, default=1, choices=[1, 2], help="1 original, 2 repost")
+    parser.add_argument(
+        "--is-only-self",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="1 saves as only-self/private for manual review, 0 submits publicly",
+    )
     parser.add_argument("--cover", help="Cover image path")
     parser.add_argument("--biliup-bin")
     parser.add_argument("--bili-cookie")
@@ -538,8 +901,35 @@ def main() -> int:
     bilibili_title = TITLE_PREFIX + translated_title
 
     source_url = args.source_url or (str(metadata.get("webpage_url") or args.input) if is_url(args.input) else None)
-    cookie_path, cookie_source = resolve_bili_cookie_path(args.bili_cookie, os.environ.get("BILIUP_COOKIE"), root)
-    upload_cmd = build_biliup_command(args, video_path, bilibili_title, source_url, cookie_path)
+    try:
+        cookie_path, cookie_source = ensure_biliup_cookie_path(
+            args.bili_cookie,
+            os.environ.get("BILIUP_COOKIE"),
+            root,
+            biliup_bin=args.biliup_bin or os.environ.get("BILIUP_BIN"),
+        )
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    upload_tags = args.tags or DEFAULT_TAGS
+    description_resolution = resolve_upload_description(
+        args,
+        title=bilibili_title,
+        tags=upload_tags,
+        source_url=source_url,
+        workdir=workdir,
+    )
+    upload_desc = description_resolution["desc"]
+    tid_resolution = resolve_upload_tid(args, workdir, bilibili_title, upload_tags, upload_desc)
+    print_tid_resolution(tid_resolution)
+    upload_cmd = build_biliup_command(
+        args,
+        video_path,
+        bilibili_title,
+        upload_desc,
+        source_url,
+        cookie_path,
+        tid_resolution["tid"],
+    )
 
     publish_metadata = {
         "input": args.input,
@@ -550,11 +940,18 @@ def main() -> int:
         "source_url": source_url,
         "video_path": str(video_path),
         "subtitles_path": str(workdir / "subtitles.zh.srt"),
+        "description_used": upload_desc,
+        "description_source": description_resolution["source"],
+        "description_reason": description_resolution["reason"],
         "subtitle_layout": args.subtitle_layout,
         "translation_quality_used": subtitle_translation_info.get("translation_quality_used", args.translation_quality),
         "glossary_file_used": subtitle_translation_info.get("glossary_file_used", glossary.source_path),
         "bili_cookie_path_used": str(cookie_path) if cookie_path else "",
         "bili_cookie_source": cookie_source,
+        "visibility_used": "private" if args.is_only_self else "public",
+        "tid_used": tid_resolution["tid"],
+        "tid_source": tid_resolution["source"],
+        "tid_reason": tid_resolution["reason"],
         "upload_command": upload_cmd,
         **title_translation_info,
         **subtitle_translation_info,
@@ -569,9 +966,6 @@ def main() -> int:
 
     if shutil.which(upload_cmd[0]) is None and not Path(upload_cmd[0]).exists():
         raise SystemExit(f"biliup command not found: {upload_cmd[0]}")
-    if cookie_path and not cookie_path.exists():
-        raise SystemExit(f"Bilibili cookie file not found: {cookie_path}")
-
     result = run(upload_cmd, check=False)
     if result.stdout:
         print(result.stdout, end="")

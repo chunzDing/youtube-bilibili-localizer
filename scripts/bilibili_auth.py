@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -21,6 +22,10 @@ def resolve_skill_root(from_file: str | Path) -> Path:
     return Path(from_file).resolve().parents[1]
 
 
+def default_biliup_login_path(skill_root: Path) -> Path:
+    return skill_root / "cookies.json"
+
+
 def default_bili_cookie_path(skill_root: Path) -> Path:
     return skill_root / ".auth" / "bilibili.cookies.json"
 
@@ -34,10 +39,20 @@ def resolve_bili_cookie_path(
         return Path(explicit_path).expanduser().resolve(), "argument"
     if env_path:
         return Path(env_path).expanduser().resolve(), "environment"
-    default_path = default_bili_cookie_path(skill_root)
+    default_path = default_biliup_login_path(skill_root)
     if default_path.exists():
-        return default_path, "default"
+        return default_path, "default_formal"
     return None, ""
+
+
+def default_biliup_bin(skill_root: Path) -> str:
+    win_biliup = skill_root / ".venv" / "Scripts" / "biliup.exe"
+    posix_biliup = skill_root / ".venv" / "bin" / "biliup"
+    if win_biliup.exists():
+        return str(win_biliup)
+    if posix_biliup.exists():
+        return str(posix_biliup)
+    return "biliup"
 
 
 def build_cookie_header(payload: dict[str, Any]) -> str:
@@ -144,6 +159,15 @@ def load_biliup_cookie_payload(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def is_formal_biliup_login_payload(payload: dict[str, Any]) -> bool:
+    token_info = payload.get("token_info")
+    if not isinstance(token_info, dict):
+        return False
+    access_token = str(token_info.get("access_token") or payload.get("access_token") or "").strip()
+    refresh_token = str(token_info.get("refresh_token") or payload.get("refresh_token") or "").strip()
+    return bool(access_token and refresh_token)
+
+
 def verify_cookie_payload(payload: dict[str, Any]) -> tuple[bool, str]:
     cookie_header = build_cookie_header(payload)
     if not cookie_header:
@@ -176,3 +200,81 @@ def verify_cookie_payload(payload: dict[str, Any]) -> tuple[bool, str]:
         return False, "Bilibili returned isLogin=false"
     uname = str(data.get("uname") or "").strip()
     return True, uname or "login verified"
+
+
+def start_biliup_login(
+    skill_root: Path,
+    *,
+    target_path: Path | None = None,
+    biliup_bin: str | None = None,
+) -> Path:
+    login_path = (target_path or default_biliup_login_path(skill_root)).expanduser().resolve()
+    login_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        biliup_bin or default_biliup_bin(skill_root),
+        "--user-cookie",
+        str(login_path),
+        "login",
+    ]
+    creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+    subprocess.Popen(command, cwd=str(skill_root), creationflags=creationflags)
+    return login_path
+
+
+def ensure_biliup_cookie_path(
+    explicit_path: str | None,
+    env_path: str | None,
+    skill_root: Path,
+    *,
+    biliup_bin: str | None = None,
+) -> tuple[Path, str]:
+    cookie_path, source = resolve_bili_cookie_path(explicit_path, env_path, skill_root)
+    login_path = default_biliup_login_path(skill_root).resolve()
+
+    if cookie_path is None:
+        launched = start_biliup_login(skill_root, target_path=login_path, biliup_bin=biliup_bin)
+        raise RuntimeError(
+            "No formal biliup login was found. "
+            f"Opened a biliup login window; complete login and rerun. Target file: {launched}"
+        )
+
+    cookie_path = cookie_path.resolve()
+    if not cookie_path.exists():
+        if source in {"default_formal", ""}:
+            launched = start_biliup_login(skill_root, target_path=login_path, biliup_bin=biliup_bin)
+            raise RuntimeError(
+                "The formal biliup login file is missing. "
+                f"Opened a biliup login window; complete login and rerun. Target file: {launched}"
+            )
+        raise RuntimeError(f"Bilibili cookie file not found: {cookie_path}")
+
+    try:
+        payload = load_biliup_cookie_payload(cookie_path)
+    except Exception as exc:
+        if source == "default_formal":
+            launched = start_biliup_login(skill_root, target_path=login_path, biliup_bin=biliup_bin)
+            raise RuntimeError(
+                "The formal biliup login file could not be read. "
+                f"Opened a biliup login window; complete login and rerun. Target file: {launched}"
+            ) from exc
+        raise RuntimeError(f"Failed to read Bilibili cookie file: {cookie_path}") from exc
+
+    validate_biliup_cookie_payload(payload)
+    is_formal = is_formal_biliup_login_payload(payload)
+    is_valid, message = verify_cookie_payload(payload)
+
+    if is_formal and is_valid:
+        return cookie_path, source
+
+    if source == "default_formal":
+        launched = start_biliup_login(skill_root, target_path=login_path, biliup_bin=biliup_bin)
+        reason = "expired or invalid" if is_formal else "not a formal biliup login state"
+        raise RuntimeError(
+            f"The formal biliup login is {reason} ({message}). "
+            f"Opened a biliup login window; complete login and rerun. Target file: {launched}"
+        )
+
+    if is_valid:
+        return cookie_path, source
+
+    raise RuntimeError(f"Bilibili cookie file is invalid: {message}")

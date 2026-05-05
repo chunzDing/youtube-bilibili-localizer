@@ -48,12 +48,51 @@ python -m playwright install chromium
   可选，默认 `biliup`
 - `BILIUP_COOKIE`
   可选，指定 cookie 文件路径
+- `BILIBILI_DEFAULT_TID`
+  可选，仅在显式 `--tid` 未提供且规则分区没有命中时作为投稿分区兜底值
 
 优先级：
 
 1. `--bili-cookie`
 2. `BILIUP_COOKIE`
 3. `.auth/bilibili.cookies.json`
+
+投稿分区优先级：
+
+1. `--tid`
+2. 规则回退
+3. `BILIBILI_DEFAULT_TID`
+4. `36`（知识区）
+
+当前脚本内置规则覆盖：
+
+- `188` 科技
+- `36` 知识
+- `160` 生活
+- `171` 电子竞技
+
+这些值表示“期望的大类”。真正调用 `biliup upload` 时，脚本会自动映射到可投稿的叶子分区，例如：
+
+- `188` -> `231`（计算机技术）
+- `36` -> `122`（野生技能协会）
+- `160` -> `21`（日常）
+
+简介优先级：
+
+1. `--desc`
+2. 默认简介回退
+
+版权默认值：
+
+- 默认 `copyright=1`
+- 只有显式传 `--copyright 2` 时才按转载处理
+- 只有转载时才附 `--source`
+
+可见性默认值：
+
+- 默认 `--is-only-self 0`
+- 即直接正常投稿
+- 需要先存为草稿再手动检查时，显式传 `--is-only-self 1`
 
 ## 翻译模式
 
@@ -122,8 +161,45 @@ scripts/run_biliup_login_helper.sh --browser chrome
   --workdir ".\runs\demo" `
   --mode dub `
   --translation-mode auto `
+  --translation-quality high
+```
+
+### Codex 模式：由助手传入简介和分区
+
+```powershell
+.\scripts\run_publish_localized_video.ps1 `
+  --input "https://www.youtube.com/watch?v=..." `
+  --workdir ".\runs\demo" `
+  --mode subtitles `
+  --translation-mode api `
   --translation-quality high `
-  --tid 171
+  --translated-title "这里填助手生成的中文标题" `
+  --desc "这里填助手生成的投稿简介" `
+  --tid 188
+```
+
+### CLI 模式：显式指定投稿分区
+
+```powershell
+.\scripts\run_publish_localized_video.ps1 `
+  --input "https://www.youtube.com/watch?v=..." `
+  --workdir ".\runs\demo" `
+  --mode subtitles `
+  --translation-mode api `
+  --translation-quality high `
+  --tid 188
+```
+
+### 显式按转载投稿
+
+```powershell
+.\scripts\run_publish_localized_video.ps1 `
+  --input "https://www.youtube.com/watch?v=..." `
+  --workdir ".\runs\demo" `
+  --mode subtitles `
+  --translation-mode api `
+  --translation-quality high `
+  --copyright 2
 ```
 
 ## 常见失败场景
