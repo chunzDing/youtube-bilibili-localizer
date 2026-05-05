@@ -1,0 +1,4 @@
+﻿interface:
+  display_name: "YouTube Bilibili Localizer"
+  short_description: "Localize YouTube videos into Chinese subtitles or dubbing and publish them to Bilibili."
+  default_prompt: "Use $youtube-bilibili-localizer to localize this video into Chinese, prefix the translated title with 【中文字幕】, and publish it to Bilibili."
