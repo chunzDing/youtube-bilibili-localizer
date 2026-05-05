@@ -1,115 +1,120 @@
-# Runtime And Publishing
+﻿# Runtime and Publishing
 
-## Required Tools
+## 必需工具
 
 - `ffmpeg`
 - `ffprobe`
 
-## Optional but Recommended Tools
+## 推荐工具
 
-- `yt-dlp`: download online inputs and fetch source metadata
-- `faster-whisper`: local speech-to-text with timestamps
-- `biliup`: automated Bilibili uploads
-- `argostranslate`: offline subtitle and title translation for `en -> zh`
-- `nvidia-cublas-cu12`: required on Windows when running `faster-whisper` on CUDA
+- `yt-dlp`
+- `biliup`
+- `playwright`
 
-## Python Dependencies
+## Python 依赖
 
-Install:
+安装：
 
 ```bash
 pip install -r requirements.txt
+python -m playwright install chromium
 ```
 
-This repository expects the Python environment to contain:
+主要依赖：
 
 - `faster-whisper`
 - `argostranslate`
 - `volcengine-python-sdk`
+- `playwright`
 
-## Environment Variables
+## 环境变量
 
-Translation and title translation:
+### 翻译和标题翻译
 
 - `VOLCENGINE_ACCESS_KEY`
 - `VOLCENGINE_SECRET_KEY`
-- `VOLCENGINE_REGION` default: `cn-north-1`
+- `VOLCENGINE_REGION`
+  默认 `cn-north-1`
 
-Mandarin dubbing:
+### 普通话配音
 
 - `VOLCENGINE_TTS_API_KEY`
-- `VOLCENGINE_TTS_RESOURCE_ID` default: `volc.service_type.10029`
+- `VOLCENGINE_TTS_RESOURCE_ID`
+  默认 `volc.service_type.10029`
 
-Uploading:
+### 投稿
 
-- `BILIUP_BIN` optional path or command name, default `biliup`
-- `BILIUP_COOKIE` optional cookie/session file for `biliup`
+- `BILIUP_BIN`
+  可选，默认 `biliup`
+- `BILIUP_COOKIE`
+  可选，指定 cookie 文件路径
 
-## Translation Modes
+优先级：
 
-- `api`: use Volcengine translation
-- `offline`: use Argos Translate for `en -> zh`
-- `auto`: try API first, then fall back to offline
+1. `--bili-cookie`
+2. `BILIUP_COOKIE`
+3. `.auth/bilibili.cookies.json`
 
-Offline mode constraints:
+## 翻译模式
 
-- first offline run may download the Argos `en -> zh` package
-- after the package is installed, later offline runs can stay local
-- offline mode currently supports only English-source content
+- `api`
+  使用 Volcengine
+- `offline`
+  使用 Argos Translate，仅支持 `en -> zh`
+- `auto`
+  先走 API，失败后自动回退到离线
 
-## Subtitle Layout
+发生回退时：
 
-- `bilingual`: Chinese on the first line, source text on the second line
-- `zh`: Chinese only
+- 控制台会明确提示
+- `translated_segments.json` 会写入 `translation_fallback_used=true`
+- `translation_fallback_reason` 会记录失败原因
 
-Default layout is `bilingual`.
+## 翻译质量模式
 
-## Bilibili Defaults
+- `high`
+  默认值。会做字幕分段优化、术语保护和翻译后清洗。
+- `standard`
+  更轻量，接近原始分段。
 
-- title prefix: `【中文字幕】`
-- default mode: `dub`
-- default tags: `中文字幕,翻译,搬运`
-- default copyright: `1`
-- add `--source` only for repost submissions (`copyright=2`)
+## 登录助手
 
-## Recommended Commands
+推荐先运行：
 
-Subtitles only:
-
-```bash
-scripts/run_publish_localized_video.sh \
-  --input "https://www.youtube.com/watch?v=..." \
-  --workdir ./runs/demo \
-  --mode subtitles \
-  --translation-mode offline \
-  --subtitle-layout bilingual \
-  --dry-run
+```powershell
+.\scripts\run_biliup_login_helper.ps1 --browser edge
 ```
 
-Windows PowerShell:
+或：
+
+```bash
+scripts/run_biliup_login_helper.sh --browser chrome
+```
+
+登录助手会：
+
+- 打开全新浏览器窗口
+- 自动轮询登录状态
+- 导出 `biliup` 可用 cookie
+- 默认写入 `.auth/bilibili.cookies.json`
+- 立即调用 Bilibili 接口验证登录态
+
+## 推荐命令
+
+### 只做字幕
 
 ```powershell
 .\scripts\run_publish_localized_video.ps1 `
   --input "https://www.youtube.com/watch?v=..." `
   --workdir ".\runs\demo" `
   --mode subtitles `
-  --translation-mode offline `
+  --translation-mode api `
+  --translation-quality high `
   --subtitle-layout bilingual `
   --dry-run
 ```
 
-Dub plus upload:
-
-```bash
-scripts/run_publish_localized_video.sh \
-  --input "https://www.youtube.com/watch?v=..." \
-  --workdir ./runs/demo \
-  --mode dub \
-  --translation-mode auto \
-  --tid 171
-```
-
-Windows PowerShell:
+### 配音并投稿
 
 ```powershell
 .\scripts\run_publish_localized_video.ps1 `
@@ -117,39 +122,51 @@ Windows PowerShell:
   --workdir ".\runs\demo" `
   --mode dub `
   --translation-mode auto `
+  --translation-quality high `
   --tid 171
 ```
 
-## Common Failure Modes
+## 常见失败场景
 
-### Missing `yt-dlp`
+### 缺少 `yt-dlp`
 
-Install `yt-dlp` or pass a local file instead of a URL.
+安装 `yt-dlp`，或者改用本地视频输入。
 
-### YouTube Bot Check
+### YouTube 触发风控
 
-Retry with:
+可以尝试：
 
+- `--cookies-from-browser edge`
 - `--cookies /path/to/cookies.txt`
-- or `--cookies-from-browser edge`
+- `--yt-dlp-impersonate edge:windows-10`
 
-### Missing `faster-whisper`
+### 缺少 `faster-whisper`
 
-Install it or pass `--transcript-json`.
+安装依赖，或者传 `--transcript-json` 复用已有 transcript。
 
-### Missing CUDA DLLs on Windows
+### Windows 上 CUDA DLL 缺失
 
-Install `nvidia-cublas-cu12` in the active environment. The localizer adds the package DLL path to `PATH` automatically.
+当前 localizer 会自动把常见 CUDA 目录注入 `PATH`，但依赖必须已经装好。必要时重建 `.venv`。
 
-### Missing Volcengine Credentials
+### Volcengine 凭证缺失或服务未开通
 
-- subtitle/title translation in `api` or `auto` mode may fall back to offline `en -> zh`
-- TTS requires `VOLCENGINE_TTS_API_KEY`
+- `api` / `auto` 模式可能回退到离线翻译
+- TTS 需要额外的 `VOLCENGINE_TTS_API_KEY`
 
-### Offline Translation Fails
+### 离线翻译效果差
 
-Pass `--source-language en` for English content, or switch back to `api` / `auto`.
+这是预期限制。优先改用：
 
-### `biliup` Upload Fails
+- `--translation-mode api`
+- `--translation-quality high`
 
-Keep `publish_metadata.json` and rerun the generated command after fixing login or CLI options.
+### `biliup` 投稿失败
+
+优先看这几类问题：
+
+- 未登录
+- cookie 文件路径错误
+- `biliup` 命令不存在
+- `tid` / `copyright` / `desc` / `title` 不符合投稿要求
+
+无论失败与否，现有产物和 `publish_metadata.json` 都会保留，方便你直接重试。

@@ -1,6 +1,7 @@
-﻿# Local secrets
+# Local secrets
 .env.local
 .env.*.local
+.auth/
 cookies.json
 cookies.txt
 chrome_cookies_copy.db

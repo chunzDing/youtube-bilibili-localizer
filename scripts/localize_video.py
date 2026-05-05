@@ -6,6 +6,7 @@ import base64
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -15,9 +16,25 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, TypeVar
 
+from translation_utils import (
+    LoadedGlossary,
+    clean_chinese_text,
+    default_glossary_path,
+    load_glossary,
+    normalize_language_code,
+    normalize_source_text,
+)
+
 
 T = TypeVar("T")
 _CUDA_DLL_HANDLES: list[Any] = []
+MAX_API_BATCH_SIZE = 16
+MIN_MERGE_DURATION = 1.2
+MIN_MERGE_CHARACTERS = 20
+MAX_SEGMENT_CHARACTERS = 160
+MAX_SEGMENT_DURATION = 9.0
+SOFT_SPLIT_RE = re.compile(r"(?<=[,;:])\s+")
+TERMINAL_PUNCT_RE = re.compile(r"[.!?。！？…]['\")\]]*$")
 
 
 @dataclass
@@ -91,18 +108,116 @@ def configure_windows_cuda_dll_paths() -> None:
     os.environ["PATH"] = os.pathsep.join(path_parts)
 
 
-def normalize_language_code(language: str | None) -> str | None:
-    if not language:
-        return None
-    return language.strip().lower().replace("_", "-").split("-", 1)[0] or None
-
-
 def format_srt_timestamp(seconds: float) -> str:
     millis = max(0, int(round(seconds * 1000)))
     hours, remainder = divmod(millis, 3_600_000)
     minutes, remainder = divmod(remainder, 60_000)
     secs, ms = divmod(remainder, 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
+
+def segment_duration(segment: Segment) -> float:
+    return max(0.0, float(segment.end) - float(segment.start))
+
+
+def has_terminal_punctuation(text: str) -> bool:
+    return bool(TERMINAL_PUNCT_RE.search(text.strip()))
+
+
+def maybe_drop_leading_partial(text: str) -> str:
+    normalized = normalize_source_text(text)
+    lowered = normalized.lower()
+    for prefix in ("and ", "but ", "so ", "then ", "because ", "or "):
+        if lowered.startswith(prefix) and len(normalized) > len(prefix) + 20:
+            return normalized[len(prefix) :].lstrip()
+    return normalized
+
+
+def split_long_segment(segment: Segment) -> list[Segment]:
+    text = normalize_source_text(segment.text)
+    if len(text) <= MAX_SEGMENT_CHARACTERS and segment_duration(segment) <= MAX_SEGMENT_DURATION:
+        return [Segment(start=segment.start, end=segment.end, text=text, translated_text=segment.translated_text)]
+
+    pieces = [piece.strip(" ,;") for piece in SOFT_SPLIT_RE.split(text) if piece.strip(" ,;")]
+    if len(pieces) <= 1:
+        return [Segment(start=segment.start, end=segment.end, text=text, translated_text=segment.translated_text)]
+
+    total_chars = sum(len(piece) for piece in pieces)
+    current_start = segment.start
+    split_segments: list[Segment] = []
+    for index, piece in enumerate(pieces):
+        if index == len(pieces) - 1:
+            current_end = segment.end
+        else:
+            ratio = len(piece) / total_chars if total_chars else 1 / len(pieces)
+            current_end = current_start + segment_duration(segment) * ratio
+        split_segments.append(
+            Segment(
+                start=current_start,
+                end=current_end,
+                text=piece,
+                translated_text="",
+            )
+        )
+        current_start = current_end
+    return split_segments
+
+
+def refine_segments(segments: list[Segment], quality: str) -> tuple[list[Segment], bool]:
+    if quality != "high":
+        return segments, False
+    if not segments:
+        return segments, False
+
+    refined: list[Segment] = []
+    buffer_segment: Segment | None = None
+
+    for original in segments:
+        current = Segment(
+            start=float(original.start),
+            end=float(original.end),
+            text=normalize_source_text(original.text),
+            translated_text="",
+        )
+        current.text = maybe_drop_leading_partial(current.text)
+        if not current.text:
+            continue
+
+        if buffer_segment is None:
+            buffer_segment = current
+            continue
+
+        buffer_should_merge = (
+            segment_duration(buffer_segment) < MIN_MERGE_DURATION
+            or len(buffer_segment.text) < MIN_MERGE_CHARACTERS
+            or not has_terminal_punctuation(buffer_segment.text)
+        )
+        merged_text = normalize_source_text(f"{buffer_segment.text} {current.text}")
+        merged_duration = current.end - buffer_segment.start
+        merge_allowed = len(merged_text) <= MAX_SEGMENT_CHARACTERS and merged_duration <= MAX_SEGMENT_DURATION
+
+        if buffer_should_merge and merge_allowed:
+            buffer_segment = Segment(
+                start=buffer_segment.start,
+                end=current.end,
+                text=merged_text,
+                translated_text="",
+            )
+            continue
+
+        refined.extend(split_long_segment(buffer_segment))
+        buffer_segment = current
+
+    if buffer_segment is not None:
+        refined.extend(split_long_segment(buffer_segment))
+
+    changed = len(refined) != len(segments) or any(
+        normalize_source_text(before.text) != after.text
+        or abs(before.start - after.start) > 0.001
+        or abs(before.end - after.end) > 0.001
+        for before, after in zip(segments[: len(refined)], refined)
+    )
+    return refined, changed
 
 
 def load_segments_from_json(path: Path) -> list[Segment]:
@@ -120,12 +235,10 @@ def load_segments_from_json(path: Path) -> list[Segment]:
         start = float(item["start"])
         end = float(item["end"])
         text = str(item.get("text") or item.get("source_text") or "").strip()
-        translated = str(
-            item.get("translated_text") or item.get("translation") or ""
-        ).strip()
+        translated = str(item.get("translated_text") or item.get("translation") or "").strip()
         if not text:
             continue
-        segments.append(Segment(start=start, end=end, text=text, translated_text=translated))
+        segments.append(Segment(start=start, end=end, text=normalize_source_text(text), translated_text=translated))
     if not segments:
         raise SystemExit("Transcript JSON did not contain usable segments")
     return segments
@@ -202,12 +315,10 @@ def transcribe_with_faster_whisper(
     try:
         from faster_whisper import WhisperModel
     except ImportError as exc:
-        raise SystemExit(
-            "faster-whisper is not installed. Install it or pass --transcript-json."
-        ) from exc
+        raise SystemExit("faster-whisper is not installed. Install it or pass --transcript-json.") from exc
 
     model = WhisperModel(model_name, device=device, compute_type=compute_type)
-    segments, _info = model.transcribe(
+    segments, info = model.transcribe(
         str(audio_path),
         language=language,
         vad_filter=True,
@@ -216,13 +327,13 @@ def transcribe_with_faster_whisper(
 
     results: list[Segment] = []
     for segment in segments:
-        text = segment.text.strip()
+        text = normalize_source_text(segment.text)
         if not text:
             continue
         results.append(Segment(start=float(segment.start), end=float(segment.end), text=text))
     if not results:
         raise SystemExit("Transcription produced no segments")
-    detected_language = normalize_language_code(getattr(_info, "language", None))
+    detected_language = normalize_language_code(getattr(info, "language", None))
     return results, detected_language
 
 
@@ -240,14 +351,12 @@ def env_required_for_translation(name: str) -> str:
     return value
 
 
-def create_volc_translate_api():
+def create_volc_translate_api() -> Any:
     try:
         from volcenginesdkcore import ApiClient, Configuration
         from volcenginesdktranslate20250301 import TRANSLATE20250301Api
     except ImportError as exc:
-        raise TranslationFailure(
-            "volcengine-python-sdk is not installed in the current environment"
-        ) from exc
+        raise TranslationFailure("volcengine-python-sdk is not installed in the current environment") from exc
 
     configuration = Configuration()
     configuration.ak = env_required_for_translation("VOLCENGINE_ACCESS_KEY")
@@ -271,9 +380,7 @@ def ensure_argos_translation(source_language: str | None, target_language: str) 
             raise TranslationFailure(
                 f"Offline translation currently supports only en->zh, got {normalized_source}->{normalized_target}"
             )
-        raise TranslationFailure(
-            "Offline translation requires source language detection or an explicit --source-language en"
-        )
+        raise TranslationFailure("Offline translation requires source language detection or an explicit --source-language en")
 
     try:
         import argostranslate.package
@@ -320,29 +427,35 @@ def translate_segments_api(
     source_language: str | None,
     target_language: str,
     batch_size: int,
+    glossary: LoadedGlossary,
 ) -> None:
     try:
         from volcenginesdktranslate20250301 import TranslateTextRequest
     except ImportError as exc:
-        raise TranslationFailure(
-            "volcengine-python-sdk is required for translation"
-        ) from exc
+        raise TranslationFailure("volcengine-python-sdk is required for translation") from exc
 
     untranslated = [segment for segment in segments if not segment.translated_text]
     if not untranslated:
         return
-    if batch_size > 16:
+    if batch_size > MAX_API_BATCH_SIZE:
         raise TranslationFailure("Volcengine TranslateText accepts at most 16 texts per request")
 
     translate_api = create_volc_translate_api()
     index_by_id = {index: segment for index, segment in enumerate(untranslated)}
     try:
         for batch_indexes in chunked(list(index_by_id.keys()), batch_size):
+            source_texts: list[str] = []
+            placeholder_sets: list[dict[str, str]] = []
+            for index in batch_indexes:
+                prepared_text, placeholders = glossary.protect_text(index_by_id[index].text)
+                source_texts.append(prepared_text)
+                placeholder_sets.append(placeholders)
+
             response = translate_api.translate_text(
                 TranslateTextRequest(
                     source_language=source_language,
                     target_language=target_language,
-                    text_list=[index_by_id[index].text for index in batch_indexes],
+                    text_list=source_texts,
                 )
             )
             translations = response.translation_list or []
@@ -354,7 +467,10 @@ def translate_segments_api(
                 translated_text = str(translations[position].translation or "").strip()
                 if not translated_text:
                     raise TranslationFailure(f"Empty translation returned for segment {batch_index}")
-                index_by_id[batch_index].translated_text = translated_text
+                index_by_id[batch_index].translated_text = glossary.normalize_translation(
+                    translated_text,
+                    placeholder_sets[position],
+                )
     except TranslationFailure:
         raise
     except Exception as exc:
@@ -365,6 +481,7 @@ def translate_segments_offline(
     segments: list[Segment],
     source_language: str | None,
     target_language: str,
+    glossary: LoadedGlossary,
 ) -> None:
     untranslated = [segment for segment in segments if not segment.translated_text]
     if not untranslated:
@@ -372,11 +489,11 @@ def translate_segments_offline(
 
     translator = ensure_argos_translation(source_language, target_language)
     for segment in untranslated:
-        text = segment.text.strip()
-        translated_text = str(translator.translate(text) if text else "").strip()
+        prepared_text, placeholders = glossary.protect_text(segment.text.strip())
+        translated_text = str(translator.translate(prepared_text) if prepared_text else "").strip()
         if not translated_text:
             raise TranslationFailure("Offline translation returned an empty subtitle line")
-        segment.translated_text = " ".join(translated_text.split())
+        segment.translated_text = glossary.normalize_translation(translated_text, placeholders)
 
 
 def translate_segments(
@@ -385,11 +502,12 @@ def translate_segments(
     target_language: str,
     batch_size: int,
     translation_mode: str,
+    glossary: LoadedGlossary,
 ) -> dict[str, Any]:
     requested_mode = translation_mode
 
     if requested_mode == "offline":
-        translate_segments_offline(segments, source_language, target_language)
+        translate_segments_offline(segments, source_language, target_language, glossary)
         return {
             "translation_mode_requested": requested_mode,
             "translation_mode_used": "offline",
@@ -398,7 +516,7 @@ def translate_segments(
         }
 
     try:
-        translate_segments_api(segments, source_language, target_language, batch_size)
+        translate_segments_api(segments, source_language, target_language, batch_size, glossary)
         return {
             "translation_mode_requested": requested_mode,
             "translation_mode_used": "api",
@@ -407,8 +525,8 @@ def translate_segments(
         }
     except TranslationFailure as exc:
         fallback_reason = str(exc)
-        print(f"! API translation failed, falling back to offline translation: {fallback_reason}")
-        translate_segments_offline(segments, source_language, target_language)
+        print(f"! API translation failed; falling back to offline translation: {fallback_reason}")
+        translate_segments_offline(segments, source_language, target_language, glossary)
         return {
             "translation_mode_requested": requested_mode,
             "translation_mode_used": "offline",
@@ -418,8 +536,8 @@ def translate_segments(
 
 
 def build_subtitle_text(segment: Segment, subtitle_layout: str) -> str:
-    translated = " ".join((segment.translated_text or "").split()).strip()
-    source = " ".join((segment.text or "").split()).strip()
+    translated = clean_chinese_text(segment.translated_text or "")
+    source = normalize_source_text(segment.text or "")
     if subtitle_layout == "bilingual" and translated and source:
         if translated == source:
             return translated
@@ -472,11 +590,7 @@ def atempo_chain(speedup: float) -> str:
     return ",".join(factors)
 
 
-def maybe_fit_segment_audio(
-    audio_path: Path,
-    target_duration: float,
-    max_speedup: float,
-) -> Path:
+def maybe_fit_segment_audio(audio_path: Path, target_duration: float, max_speedup: float) -> Path:
     actual_duration = probe_duration(audio_path)
     if actual_duration <= 0 or target_duration <= 0:
         return audio_path
@@ -505,13 +619,7 @@ def maybe_fit_segment_audio(
     return adjusted
 
 
-def synthesize_volc_tts(
-    text: str,
-    *,
-    speaker: str,
-    response_format: str,
-    sample_rate: int,
-) -> bytes:
+def synthesize_volc_tts(text: str, *, speaker: str, response_format: str, sample_rate: int) -> bytes:
     api_key = env_required("VOLCENGINE_TTS_API_KEY")
     resource_id = os.environ.get("VOLCENGINE_TTS_RESOURCE_ID", "volc.service_type.10029").strip() or "volc.service_type.10029"
     body = json.dumps(
@@ -554,8 +662,8 @@ def synthesize_volc_tts(
         with urllib.request.urlopen(request) as response:
             response_text = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise SystemExit(f"Volc TTS request failed ({exc.code}): {body}") from exc
+        body_text = exc.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"Volc TTS request failed ({exc.code}): {body_text}") from exc
 
     audio_parts: list[bytes] = []
     final_code: int | None = None
@@ -590,7 +698,7 @@ def synthesize_tts_segments(
     audio_dir.mkdir(parents=True, exist_ok=True)
     rendered: list[Path] = []
     for index, segment in enumerate(segments):
-        text = (segment.translated_text or "").strip()
+        text = clean_chinese_text(segment.translated_text or "")
         if not text:
             continue
         output_path = audio_dir / f"tts_{index:04d}.{response_format}"
@@ -623,29 +731,14 @@ def build_dub_track(segments: list[Segment], rendered_paths: list[Path], output_
         label = f"a{index}"
         filter_lines.append(f"[{index}:a]adelay={delay_ms}|{delay_ms}[{label}]")
         mix_inputs.append(f"[{label}]")
-    filter_lines.append(
-        f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=longest:normalize=0[mix]"
-    )
+    filter_lines.append(f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=longest:normalize=0[mix]")
     filter_path = output_path.with_suffix(".filter.txt")
     filter_path.write_text(";\n".join(filter_lines) + "\n", encoding="utf-8")
-    cmd.extend(
-        [
-            "-filter_complex_script",
-            str(filter_path),
-            "-map",
-            "[mix]",
-            str(output_path),
-        ]
-    )
+    cmd.extend(["-filter_complex_script", str(filter_path), "-map", "[mix]", str(output_path)])
     run(cmd)
 
 
-def mix_with_original_audio(
-    original_audio: Path,
-    dub_track: Path,
-    output_path: Path,
-    background_volume: float,
-) -> None:
+def mix_with_original_audio(original_audio: Path, dub_track: Path, output_path: Path, background_volume: float) -> None:
     run(
         [
             "ffmpeg",
@@ -753,6 +846,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--translation-target-language", default="zh", help="Volcengine translation target language code")
     parser.add_argument("--translation-batch-size", type=int, default=16, help="Volcengine TranslateText batch size, max 16")
     parser.add_argument("--translation-mode", default="api", choices=["api", "offline", "auto"], help="Subtitle translation mode")
+    parser.add_argument("--translation-quality", default="high", choices=["standard", "high"], help="Translation quality mode")
+    parser.add_argument("--glossary-file", help="Optional glossary JSON file used to normalize terminology")
     parser.add_argument("--subtitle-layout", default="bilingual", choices=["zh", "bilingual"], help="Subtitle layout: Chinese only or Chinese plus original source text")
     parser.add_argument("--voice", default="zh_female_qingxin", help="Volc TTS speaker name")
     parser.add_argument("--tts-format", default="wav", choices=["mp3", "wav", "aac"], help="Volc TTS output format")
@@ -767,8 +862,11 @@ def main() -> int:
     args = parse_args()
     workdir = Path(args.workdir).expanduser().resolve()
     workdir.mkdir(parents=True, exist_ok=True)
-    if not 1 <= args.translation_batch_size <= 16:
+    if not 1 <= args.translation_batch_size <= MAX_API_BATCH_SIZE:
         raise SystemExit("--translation-batch-size must be between 1 and 16")
+
+    glossary_path = Path(args.glossary_file).expanduser().resolve() if args.glossary_file else default_glossary_path(Path(__file__).resolve().parents[1])
+    glossary = load_glossary(glossary_path if glossary_path.exists() else None)
 
     require_command("ffmpeg")
     require_command("ffprobe")
@@ -801,27 +899,32 @@ def main() -> int:
         write_json(transcript_path, {"segments": [asdict(segment) for segment in segments]})
 
     effective_source_language = normalize_language_code(args.source_language) or detected_language
+    refined_segments, refined_used = refine_segments(segments, args.translation_quality)
 
     translation_info = translate_segments(
-        segments,
+        refined_segments,
         effective_source_language,
         args.translation_target_language,
         args.translation_batch_size,
         args.translation_mode,
+        glossary,
     )
     translated_path = workdir / "translated_segments.json"
     write_json(
         translated_path,
         {
-            "segments": [asdict(segment) for segment in segments],
+            "segments": [asdict(segment) for segment in refined_segments],
             "source_language_used": effective_source_language,
             "subtitle_layout_used": args.subtitle_layout,
+            "translation_quality_used": args.translation_quality,
+            "glossary_file_used": glossary.source_path,
+            "segment_refinement_used": refined_used,
             **translation_info,
         },
     )
 
     subtitles_path = workdir / "subtitles.zh.srt"
-    write_srt(subtitles_path, segments, args.subtitle_layout)
+    write_srt(subtitles_path, refined_segments, args.subtitle_layout)
 
     if args.skip_tts:
         final_video = workdir / "final.mp4"
@@ -837,7 +940,7 @@ def main() -> int:
         return 0
 
     rendered_paths = synthesize_tts_segments(
-        segments,
+        refined_segments,
         workdir / "tts_segments",
         speaker=args.voice,
         response_format=args.tts_format,
@@ -848,15 +951,10 @@ def main() -> int:
         raise SystemExit("No TTS audio was generated")
 
     dub_track = workdir / "dub_track.wav"
-    build_dub_track(segments, rendered_paths, dub_track)
+    build_dub_track(refined_segments, rendered_paths, dub_track)
 
     final_audio = workdir / "final_audio.wav"
-    mix_with_original_audio(
-        source_audio,
-        dub_track,
-        final_audio,
-        background_volume=args.background_volume,
-    )
+    mix_with_original_audio(source_audio, dub_track, final_audio, background_volume=args.background_volume)
 
     final_video = workdir / "final.mp4"
     export_final_video(

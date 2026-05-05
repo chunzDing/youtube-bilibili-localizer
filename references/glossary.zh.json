@@ -1,0 +1,57 @@
+{
+  "terms": [
+    {
+      "source": "vibe coding",
+      "target": "氛围编程",
+      "aliases": ["vibe-coding", "Vibe Coding", "氛围编码"]
+    },
+    {
+      "source": "prompt",
+      "target": "提示词",
+      "aliases": ["prompts", "提示"]
+    },
+    {
+      "source": "SaaS",
+      "target": "SaaS",
+      "protect": true,
+      "aliases": ["saas", "Sas"]
+    },
+    {
+      "source": "Base44",
+      "target": "Base44",
+      "protect": true,
+      "aliases": ["base 44", "base44", "44号基地"]
+    },
+    {
+      "source": "landing page",
+      "target": "落地页",
+      "aliases": ["landing pages"]
+    },
+    {
+      "source": "workflow",
+      "target": "工作流",
+      "aliases": ["workflows"]
+    },
+    {
+      "source": "roadblock",
+      "target": "卡点",
+      "aliases": ["roadblocks", "障碍", "路障"]
+    },
+    {
+      "source": "AI agent",
+      "target": "AI 智能体",
+      "aliases": ["AI agents", "agent", "agents"]
+    },
+    {
+      "source": "Bilibili",
+      "target": "Bilibili",
+      "protect": true,
+      "aliases": ["bilibili", "B站"]
+    },
+    {
+      "source": "biliup",
+      "target": "biliup",
+      "protect": true
+    }
+  ]
+}

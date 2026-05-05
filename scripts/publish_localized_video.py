@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import json
@@ -9,6 +9,15 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+
+from bilibili_auth import resolve_bili_cookie_path, resolve_skill_root
+from translation_utils import (
+    LoadedGlossary,
+    clean_title_text,
+    default_glossary_path,
+    load_glossary,
+    normalize_language_code,
+)
 
 
 TITLE_PREFIX = "【中文字幕】"
@@ -53,7 +62,7 @@ def load_env_file(path: Path) -> None:
 
 
 def skill_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    return resolve_skill_root(__file__)
 
 
 def localizer_script() -> Path:
@@ -81,23 +90,6 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 def fallback_title(value: str) -> str:
     stripped = value.rstrip("/")
     return stripped.rsplit("/", 1)[-1] or "video"
-
-
-def normalize_language_code(language: str | None) -> str | None:
-    if not language:
-        return None
-    return language.strip().lower().replace("_", "-").split("-", 1)[0] or None
-
-
-def clean_title(title: str) -> str:
-    title = re.sub(
-        r"^[\[\(【]\s*(中文字幕|中英字幕|中字|中文翻译|中文配音|Chinese subtitles?)\s*[\]\)】]\s*",
-        "",
-        title,
-        flags=re.IGNORECASE,
-    )
-    title = re.sub(r"\s+", " ", title).strip()
-    return title or "视频"
 
 
 def fetch_metadata(
@@ -160,12 +152,8 @@ def ensure_argos_title_translation(source_language: str | None) -> Any:
     normalized_source = normalize_language_code(source_language)
     if normalized_source != "en":
         if normalized_source:
-            raise TranslationFailure(
-                f"Offline title translation currently supports only en->zh, got {normalized_source}->zh"
-            )
-        raise TranslationFailure(
-            "Offline title translation requires source language detection or an explicit --source-language en"
-        )
+            raise TranslationFailure(f"Offline title translation currently supports only en->zh, got {normalized_source}->zh")
+        raise TranslationFailure("Offline title translation requires source language detection or an explicit --source-language en")
 
     try:
         import argostranslate.package
@@ -207,19 +195,20 @@ def ensure_argos_title_translation(source_language: str | None) -> Any:
     return translation
 
 
-def translate_title_api(title: str, source_language: str | None) -> str:
+def translate_title_api(title: str, source_language: str | None, glossary: LoadedGlossary) -> str:
     try:
         from volcenginesdktranslate20250301 import TranslateTextRequest
     except ImportError as exc:
         raise TranslationFailure("volcengine-python-sdk is required for title translation") from exc
 
     api = create_volc_translate_api()
+    prepared_title, placeholders = glossary.protect_text(title)
     try:
         response = api.translate_text(
             TranslateTextRequest(
                 source_language=source_language,
                 target_language="zh",
-                text_list=[title],
+                text_list=[prepared_title],
             )
         )
     except Exception as exc:
@@ -229,20 +218,26 @@ def translate_title_api(title: str, source_language: str | None) -> str:
     if not translations:
         raise TranslationFailure("Volcengine title translation returned no text")
     translated = str(translations[0].translation or "").strip()
-    return clean_title(translated)
+    return clean_title_text(glossary.normalize_translation(translated, placeholders))
 
 
-def translate_title_offline(title: str, source_language: str | None) -> str:
+def translate_title_offline(title: str, source_language: str | None, glossary: LoadedGlossary) -> str:
     translator = ensure_argos_title_translation(source_language)
-    translated = str(translator.translate(title) if title else "").strip()
+    prepared_title, placeholders = glossary.protect_text(title)
+    translated = str(translator.translate(prepared_title) if prepared_title else "").strip()
     if not translated:
         raise TranslationFailure("Offline title translation returned no text")
-    return clean_title(" ".join(translated.split()))
+    return clean_title_text(glossary.normalize_translation(translated, placeholders))
 
 
-def translate_title(title: str, source_language: str | None, translation_mode: str) -> tuple[str, dict[str, Any]]:
+def translate_title(
+    title: str,
+    source_language: str | None,
+    translation_mode: str,
+    glossary: LoadedGlossary,
+) -> tuple[str, dict[str, Any]]:
     if translation_mode == "offline":
-        translated = translate_title_offline(title, source_language)
+        translated = translate_title_offline(title, source_language, glossary)
         return translated, {
             "translation_mode_requested": translation_mode,
             "title_translation_mode_used": "offline",
@@ -251,7 +246,7 @@ def translate_title(title: str, source_language: str | None, translation_mode: s
         }
 
     try:
-        translated = translate_title_api(title, source_language)
+        translated = translate_title_api(title, source_language, glossary)
         return translated, {
             "translation_mode_requested": translation_mode,
             "title_translation_mode_used": "api",
@@ -260,8 +255,8 @@ def translate_title(title: str, source_language: str | None, translation_mode: s
         }
     except TranslationFailure as exc:
         fallback_reason = str(exc)
-        print(f"! API title translation failed, falling back to offline translation: {fallback_reason}", flush=True)
-        translated = translate_title_offline(title, source_language)
+        print(f"! API title translation failed; falling back to offline translation: {fallback_reason}", flush=True)
+        translated = translate_title_offline(title, source_language, glossary)
         return translated, {
             "translation_mode_requested": translation_mode,
             "title_translation_mode_used": "offline",
@@ -312,12 +307,7 @@ def download_source_video(
     return resolve_downloaded_source(workdir)
 
 
-def run_localizer(
-    args: argparse.Namespace,
-    python_exe: str,
-    workdir: Path,
-    input_value: str,
-) -> None:
+def run_localizer(args: argparse.Namespace, python_exe: str, workdir: Path, input_value: str) -> None:
     cmd = [
         python_exe,
         str(localizer_script()),
@@ -333,6 +323,8 @@ def run_localizer(
         args.whisper_compute_type,
         "--translation-mode",
         args.translation_mode,
+        "--translation-quality",
+        args.translation_quality,
         "--subtitle-layout",
         args.subtitle_layout,
         "--voice",
@@ -340,6 +332,8 @@ def run_localizer(
         "--background-volume",
         str(args.background_volume),
     ]
+    if args.glossary_file:
+        cmd.extend(["--glossary-file", args.glossary_file])
     if args.cookies_from_browser:
         cmd.extend(["--cookies-from-browser", args.cookies_from_browser])
     if args.cookies:
@@ -382,12 +376,17 @@ def selected_video_path(workdir: Path, mode: str) -> Path:
     raise SystemExit(f"could not find a video to upload in {workdir}")
 
 
-def build_biliup_command(args: argparse.Namespace, video_path: Path, title: str, source_url: str | None) -> list[str]:
+def build_biliup_command(
+    args: argparse.Namespace,
+    video_path: Path,
+    title: str,
+    source_url: str | None,
+    cookie_path: Path | None,
+) -> list[str]:
     biliup_bin = args.biliup_bin or os.environ.get("BILIUP_BIN") or "biliup"
     cmd = [biliup_bin]
-    cookie = args.bili_cookie or os.environ.get("BILIUP_COOKIE")
-    if cookie:
-        cmd.extend(["--user-cookie", cookie])
+    if cookie_path:
+        cmd.extend(["--user-cookie", str(cookie_path)])
     cmd.extend(["upload", str(video_path), "--title", title])
 
     if args.desc:
@@ -424,7 +423,21 @@ def load_subtitle_translation_info(workdir: Path, subtitle_layout: str) -> dict[
         "subtitle_translation_fallback_reason": translated_payload.get("translation_fallback_reason", ""),
         "source_language_used": translated_payload.get("source_language_used"),
         "subtitle_layout_used": translated_payload.get("subtitle_layout_used", subtitle_layout),
+        "translation_quality_used": translated_payload.get("translation_quality_used", "standard"),
+        "glossary_file_used": translated_payload.get("glossary_file_used", ""),
+        "segment_refinement_used": bool(translated_payload.get("segment_refinement_used")),
     }
+
+
+def classify_upload_failure(result: subprocess.CompletedProcess[str]) -> str:
+    combined = f"{result.stdout}\n{result.stderr}".lower()
+    if "账号未登录" in combined or "not login" in combined or "code: -101" in combined:
+        return "Bilibili account is not logged in. Re-run the login helper and try again."
+    if "no such file" in combined or "cannot find the file" in combined:
+        return "The configured biliup cookie path does not exist."
+    if "copyright" in combined or "tid" in combined or "参数" in combined:
+        return "Bilibili rejected the submission parameters. Check tid, copyright, title, and description."
+    return "biliup upload failed."
 
 
 def parse_args() -> argparse.Namespace:
@@ -448,6 +461,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--background-volume", type=float, default=0.12)
     parser.add_argument("--sidecar-subtitles", action="store_true")
     parser.add_argument("--translation-mode", default="api", choices=["api", "offline", "auto"], help="Subtitle and title translation mode")
+    parser.add_argument("--translation-quality", default="high", choices=["standard", "high"], help="Translation quality mode")
+    parser.add_argument("--glossary-file", help="Optional glossary JSON file used to normalize terminology")
     parser.add_argument("--subtitle-layout", default="bilingual", choices=["zh", "bilingual"], help="Subtitle layout for localized output")
     parser.add_argument("--translated-title", help="Override automatic title translation")
     parser.add_argument("--tags", default=DEFAULT_TAGS)
@@ -467,6 +482,10 @@ def main() -> int:
     args = parse_args()
     if args.env_file:
         load_env_file(Path(args.env_file))
+
+    root = skill_root()
+    glossary_path = Path(args.glossary_file).expanduser().resolve() if args.glossary_file else default_glossary_path(root)
+    glossary = load_glossary(glossary_path if glossary_path.exists() else None)
 
     workdir = Path(args.workdir).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
@@ -500,9 +519,9 @@ def main() -> int:
         args.source_language or metadata.get("language") or subtitle_translation_info.get("source_language_used")
     )
 
-    original_title = clean_title(str(metadata.get("title") or fallback_title(args.input)))
+    original_title = clean_title_text(str(metadata.get("title") or fallback_title(args.input)))
     if args.translated_title:
-        translated_title = clean_title(args.translated_title)
+        translated_title = clean_title_text(args.translated_title)
         title_translation_info = {
             "translation_mode_requested": args.translation_mode,
             "title_translation_mode_used": "manual",
@@ -514,11 +533,13 @@ def main() -> int:
             original_title,
             source_language_hint,
             args.translation_mode,
+            glossary,
         )
     bilibili_title = TITLE_PREFIX + translated_title
 
     source_url = args.source_url or (str(metadata.get("webpage_url") or args.input) if is_url(args.input) else None)
-    upload_cmd = build_biliup_command(args, video_path, bilibili_title, source_url)
+    cookie_path, cookie_source = resolve_bili_cookie_path(args.bili_cookie, os.environ.get("BILIUP_COOKIE"), root)
+    upload_cmd = build_biliup_command(args, video_path, bilibili_title, source_url, cookie_path)
 
     publish_metadata = {
         "input": args.input,
@@ -530,6 +551,10 @@ def main() -> int:
         "video_path": str(video_path),
         "subtitles_path": str(workdir / "subtitles.zh.srt"),
         "subtitle_layout": args.subtitle_layout,
+        "translation_quality_used": subtitle_translation_info.get("translation_quality_used", args.translation_quality),
+        "glossary_file_used": subtitle_translation_info.get("glossary_file_used", glossary.source_path),
+        "bili_cookie_path_used": str(cookie_path) if cookie_path else "",
+        "bili_cookie_source": cookie_source,
         "upload_command": upload_cmd,
         **title_translation_info,
         **subtitle_translation_info,
@@ -544,12 +569,16 @@ def main() -> int:
 
     if shutil.which(upload_cmd[0]) is None and not Path(upload_cmd[0]).exists():
         raise SystemExit(f"biliup command not found: {upload_cmd[0]}")
+    if cookie_path and not cookie_path.exists():
+        raise SystemExit(f"Bilibili cookie file not found: {cookie_path}")
 
     result = run(upload_cmd, check=False)
     if result.stdout:
         print(result.stdout, end="")
     if result.stderr:
         print(result.stderr, file=sys.stderr, end="")
+    if result.returncode != 0:
+        raise SystemExit(classify_upload_failure(result))
     return result.returncode
 
 

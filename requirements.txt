@@ -1,4 +1,5 @@
-﻿faster-whisper
+faster-whisper
 argostranslate
 volcengine-python-sdk
+playwright
 nvidia-cublas-cu12==12.0.2.224; platform_system == "Windows"
