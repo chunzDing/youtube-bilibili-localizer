@@ -1,0 +1,26 @@
+# Local secrets
+.env.local
+.env.*.local
+cookies.json
+cookies.txt
+chrome_cookies_copy.db
+--impersonate
+
+# Run artifacts
+runs/
+*.log
+*.mp4
+*.wav
+*.srt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
