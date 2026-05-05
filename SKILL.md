@@ -1,4 +1,4 @@
-﻿---
+---
 name: youtube-bilibili-localizer
 description: Localize YouTube or local videos into Simplified Chinese subtitles or Mandarin dubbing and publish the result to Bilibili. Use when Codex needs to take a video link or local MP4, generate Chinese or bilingual subtitles, optionally synthesize Mandarin dubbing, translate the source title into Chinese with a 【中文字幕】 prefix, prepare Bilibili metadata, and optionally upload with biliup.
 ---
@@ -54,6 +54,18 @@ scripts/run_publish_localized_video.sh \
   --dry-run
 ```
 
+On Windows PowerShell, prefer:
+
+```powershell
+.\scripts\run_publish_localized_video.ps1 `
+  --input "https://www.youtube.com/watch?v=..." `
+  --workdir ".\runs\demo" `
+  --mode subtitles `
+  --translation-mode offline `
+  --subtitle-layout bilingual `
+  --dry-run
+```
+
 4. Review outputs in the work directory before uploading.
 
 Check:
@@ -90,5 +102,7 @@ Prefer this order:
 
 - [scripts/publish_localized_video.py](scripts/publish_localized_video.py): main entry point for localization, metadata generation, and Bilibili upload
 - [scripts/localize_video.py](scripts/localize_video.py): download, ASR, subtitle translation, dubbing, and export pipeline
+- [scripts/run_publish_localized_video.ps1](scripts/run_publish_localized_video.ps1): Windows publisher launcher
+- [scripts/run_localize_video.ps1](scripts/run_localize_video.ps1): Windows localizer launcher
 - [scripts/run_publish_localized_video.sh](scripts/run_publish_localized_video.sh): shell wrapper that prefers the local `.venv`
 - [references/runtime-and-publishing.md](references/runtime-and-publishing.md): setup notes, environment variables, and troubleshooting

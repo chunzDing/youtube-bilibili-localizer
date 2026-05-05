@@ -1,8 +1,8 @@
-﻿# YouTube Bilibili Localizer
+# YouTube Bilibili Localizer
 
 中文说明 / English documentation
 
-## 简介
+## 简介 / Summary
 
 这是一个可独立分发的 Codex skill 仓库，用来把 YouTube 或本地视频汉化后发布到 Bilibili。
 
@@ -16,8 +16,6 @@
 - 把原标题翻译成中文，并自动加上 `【中文字幕】` 前缀
 - 生成投稿元数据并可用 `biliup` 自动投稿到 Bilibili
 
-## Overview
-
 This repository packages a standalone Codex skill for localizing YouTube or local videos into Chinese and publishing them to Bilibili.
 
 It combines the localization and publishing workflow into one skill and supports:
@@ -30,14 +28,60 @@ It combines the localization and publishing workflow into one skill and supports
 - translating the source title into Chinese with the `【中文字幕】` prefix
 - preparing Bilibili metadata and optionally uploading with `biliup`
 
+## Features
+
+- One-skill workflow for localization plus Bilibili publishing
+- Offline subtitle and title translation for `en -> zh`
+- Bilingual subtitles by default
+- Optional Mandarin dubbing
+- Windows CUDA-friendly `faster-whisper` setup
+- Automatic Bilibili title prefixing and metadata generation
+- Default upload type set to `original/self-made`
+
+## Quick Start
+
+### Windows PowerShell
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+.\scripts\run_publish_localized_video.ps1 `
+  --input "https://www.youtube.com/watch?v=VIDEO_ID" `
+  --workdir ".\runs\demo" `
+  --mode subtitles `
+  --translation-mode offline `
+  --subtitle-layout bilingual `
+  --dry-run
+```
+
+### macOS / Linux
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+scripts/run_publish_localized_video.sh \
+  --input "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --workdir ./runs/demo \
+  --mode subtitles \
+  --translation-mode offline \
+  --subtitle-layout bilingual \
+  --dry-run
+```
+
 ## Repository Layout
 
 - `SKILL.md`: Codex skill entry
 - `agents/openai.yaml`: skill UI metadata
 - `scripts/localize_video.py`: download, ASR, translation, dubbing, export
 - `scripts/publish_localized_video.py`: title translation, metadata generation, optional Bilibili upload
-- `scripts/run_localize_video.sh`: localizer launcher
-- `scripts/run_publish_localized_video.sh`: publisher launcher
+- `scripts/run_localize_video.ps1`: Windows localizer launcher
+- `scripts/run_publish_localized_video.ps1`: Windows publisher launcher
+- `scripts/run_localize_video.sh`: shell localizer launcher
+- `scripts/run_publish_localized_video.sh`: shell publisher launcher
 - `references/runtime-and-publishing.md`: setup notes and troubleshooting
 - `requirements.txt`: Python dependencies for the local pipeline
 
@@ -45,9 +89,19 @@ It combines the localization and publishing workflow into one skill and supports
 
 ### 作为 GitHub 仓库使用
 
+Windows:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+macOS / Linux:
+
 ```bash
 python -m venv .venv
-. .venv/bin/activate
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -69,9 +123,19 @@ pip install -r requirements.txt
 
 ### Use as a GitHub repository
 
+Windows:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+macOS / Linux:
+
 ```bash
 python -m venv .venv
-. .venv/bin/activate
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -89,9 +153,9 @@ Place the repository under your Codex skills directory, for example:
 - Windows: `%USERPROFILE%\\.codex\\skills\\youtube-bilibili-localizer`
 - macOS / Linux: `${CODEX_HOME:-$HOME/.codex}/skills/youtube-bilibili-localizer`
 
-## 环境变量
+## 环境变量 / Environment Variables
 
-复制 `.env.example` 为 `.env.local` 或手动设置环境变量：
+复制 `.env.example` 为 `.env.local`，或手动设置：
 
 - `VOLCENGINE_ACCESS_KEY`
 - `VOLCENGINE_SECRET_KEY`
@@ -103,9 +167,7 @@ Place the repository under your Codex skills directory, for example:
 
 离线翻译模式下，字幕和标题默认使用本地 Argos Translate；首次运行可能会联网下载 `en -> zh` 语言包。
 
-## Environment Variables
-
-Copy `.env.example` to `.env.local` or export the variables manually:
+Copy `.env.example` to `.env.local`, or export these variables manually:
 
 - `VOLCENGINE_ACCESS_KEY`
 - `VOLCENGINE_SECRET_KEY`
@@ -119,7 +181,35 @@ In offline mode, subtitles and title translation use local Argos Translate. The 
 
 ## Usage
 
-Subtitles only, offline translation, bilingual subtitles:
+### PowerShell
+
+Subtitles only:
+
+```powershell
+.\scripts\run_publish_localized_video.ps1 `
+  --input "https://www.youtube.com/watch?v=VIDEO_ID" `
+  --workdir ".\runs\demo" `
+  --mode subtitles `
+  --translation-mode offline `
+  --subtitle-layout bilingual `
+  --dry-run
+```
+
+Full localization plus upload:
+
+```powershell
+.\scripts\run_publish_localized_video.ps1 `
+  --input "https://www.youtube.com/watch?v=VIDEO_ID" `
+  --workdir ".\runs\demo" `
+  --mode dub `
+  --translation-mode auto `
+  --tags "中文字幕,翻译,搬运" `
+  --tid 171
+```
+
+### Bash
+
+Subtitles only:
 
 ```bash
 scripts/run_publish_localized_video.sh \
@@ -143,12 +233,27 @@ scripts/run_publish_localized_video.sh \
   --tid 171
 ```
 
+## Current Behavior
+
+- Default subtitle layout: `bilingual`
+- Default title format: `【中文字幕】` + translated title
+- Default upload type: `original/self-made`
+- Offline translation currently supports only English-source content
+- Use `--dry-run` first if you want metadata without uploading
+
 ## 投稿规则 / Publishing Notes
 
 - 默认标题格式：`【中文字幕】` + 汉化后的原标题
 - 默认字幕布局：上中文，下原文
 - 默认投稿类型：`自制 / original`
 - 仅在明确转载场景下切换为 `转载 / repost`
+
+## Limitations
+
+- Offline translation currently supports only `en -> zh`
+- Bilibili upload depends on local `biliup` login state
+- CUDA acceleration still depends on the local machine runtime
+- This repository contains adapted code and should not be made public without confirming upstream redistribution rights
 
 ## Attribution / 致谢
 

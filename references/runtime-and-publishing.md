@@ -1,4 +1,4 @@
-﻿# Runtime And Publishing
+# Runtime And Publishing
 
 ## Required Tools
 
@@ -86,6 +86,18 @@ scripts/run_publish_localized_video.sh \
   --dry-run
 ```
 
+Windows PowerShell:
+
+```powershell
+.\scripts\run_publish_localized_video.ps1 `
+  --input "https://www.youtube.com/watch?v=..." `
+  --workdir ".\runs\demo" `
+  --mode subtitles `
+  --translation-mode offline `
+  --subtitle-layout bilingual `
+  --dry-run
+```
+
 Dub plus upload:
 
 ```bash
@@ -94,6 +106,17 @@ scripts/run_publish_localized_video.sh \
   --workdir ./runs/demo \
   --mode dub \
   --translation-mode auto \
+  --tid 171
+```
+
+Windows PowerShell:
+
+```powershell
+.\scripts\run_publish_localized_video.ps1 `
+  --input "https://www.youtube.com/watch?v=..." `
+  --workdir ".\runs\demo" `
+  --mode dub `
+  --translation-mode auto `
   --tid 171
 ```
 
